@@ -56,6 +56,7 @@ function permission(overrides: Partial<CopyPermission> = {}): CopyPermission {
   };
   return { ...base, signedPolicyHash: copyPolicyHash(base), ...overrides };
 }
+
 function signal(overrides: Partial<CopySignal> = {}): CopySignal {
   return {
     sourcePositionId: "pos-a-1",
@@ -75,6 +76,7 @@ function signal(overrides: Partial<CopySignal> = {}): CopySignal {
     ...overrides,
   };
 }
+
 function context(
   overrides: Partial<CopyExecutionContext> = {},
 ): CopyExecutionContext {
@@ -86,6 +88,7 @@ function context(
       usedThisWeekUsdc: 0,
       openExposureUsdc: 0,
       realizedLossAtomic: "0",
+      principalAtRiskAtomic: "0",
     },
     existingClaimIds: new Set(),
     ancestryAgentIds: ["agent-a"],
@@ -96,6 +99,7 @@ function context(
     ...overrides,
   };
 }
+
 const reason = (v: ReturnType<typeof evaluateCopy>) =>
   "reason" in v ? v.reason : null;
 
@@ -186,20 +190,24 @@ test("duplicate, stale, full and exhausted markets skip before signing", () => {
   );
 });
 test("confidence, payout, position and rolling budgets are hard floors/caps", () => {
+
   assert.equal(
     reason(
       evaluateCopy(permission(), signal({ confidenceBps: 6999 }), context()),
     ),
     "confidence_below_floor",
   );
+
   assert.equal(
     reason(evaluateCopy(permission(), signal({ payoutBps: 11999 }), context())),
     "payout_below_floor",
   );
+
   assert.equal(
     reason(evaluateCopy(permission(), signal({ stakeUsdc: 6 }), context())),
     "position_cap",
   );
+
   assert.equal(
     reason(
       evaluateCopy(
@@ -211,6 +219,7 @@ test("confidence, payout, position and rolling budgets are hard floors/caps", ()
             usedThisWeekUsdc: 0,
             openExposureUsdc: 0,
             realizedLossAtomic: "0",
+            principalAtRiskAtomic: "0",
           },
         }),
       ),
@@ -218,6 +227,7 @@ test("confidence, payout, position and rolling budgets are hard floors/caps", ()
     "daily_cap",
   );
 });
+
 test("the signed realized-loss limit reserves the full next principal", () => {
   // Limit 15 USDC, next stake 3 USDC — so 12 USDC of prior loss is the exact edge.
   const priorLoss = (atomic: bigint) =>
@@ -227,16 +237,69 @@ test("the signed realized-loss limit reserves the full next principal", () => {
         usedThisWeekUsdc: 0,
         openExposureUsdc: 0,
         realizedLossAtomic: String(atomic),
+        principalAtRiskAtomic: "0",
       },
     });
+
   assert.equal(
     reason(evaluateCopy(permission(), signal(), priorLoss(12n * UNIT + 1n))),
     "loss_limit",
   );
+
   assert.equal(
     evaluateCopy(permission(), signal(), priorLoss(12n * UNIT)).allowed,
     true,
   );
+});
+
+});
+
+test("open principal at risk is counted separately from realized (settled) loss", () => {
+  // Before: a single realizedLossAtomic field conflated settled loss with open
+  // principal — a position still open would be counted as already realized.
+  // After: principalAtRiskAtomic is a separate field; both are summed in the gate.
+
+  // 9 USDC settled loss + 3 USDC open principal + 3 USDC next stake = 15 USDC = limit. Exactly at edge.
+  const atEdge = context({
+    usage: { usedTodayUsdc: 0, usedThisWeekUsdc: 0, openExposureUsdc: 0,
+      realizedLossAtomic: String(9n * UNIT), principalAtRiskAtomic: String(3n * UNIT) },
+  });
+  assert.deepEqual(evaluateCopy(permission(), signal(), atEdge), { allowed: true, stakeUsdc: 3 });
+
+  // 9 USDC settled + 3 USDC open + 3 USDC stake = 15 USDC = limit — allowed.
+  // Pushing open principal 1 atom over tips it past the ceiling.
+  const oneOver = context({
+    usage: { usedTodayUsdc: 0, usedThisWeekUsdc: 0, openExposureUsdc: 0,
+      realizedLossAtomic: String(9n * UNIT), principalAtRiskAtomic: String(3n * UNIT + 1n) },
+  });
+  assert.equal(reason(evaluateCopy(permission(), signal(), oneOver)), "loss_limit");
+
+  // All open principal, zero settled loss: open positions must NOT be shown as realized.
+  const allOpen = context({
+    usage: { usedTodayUsdc: 0, usedThisWeekUsdc: 0, openExposureUsdc: 0,
+      realizedLossAtomic: "0", principalAtRiskAtomic: String(12n * UNIT) },
+  });
+  assert.deepEqual(evaluateCopy(permission(), signal(), allOpen), { allowed: true, stakeUsdc: 3 });
+
+  // All open, 1 atom over: still blocked correctly even with zero realized loss.
+  const allOpenBlocked = context({
+    usage: { usedTodayUsdc: 0, usedThisWeekUsdc: 0, openExposureUsdc: 0,
+      realizedLossAtomic: "0", principalAtRiskAtomic: String(12n * UNIT + 1n) },
+  });
+  assert.equal(reason(evaluateCopy(permission(), signal(), allOpenBlocked)), "loss_limit");
+});
+
+test("malformed principalAtRiskAtomic is rejected as malformed_context", () => {
+  const bad = (principalAtRiskAtomic: unknown) => context({
+    usage: { usedTodayUsdc: 0, usedThisWeekUsdc: 0, openExposureUsdc: 0,
+      realizedLossAtomic: "0", principalAtRiskAtomic: principalAtRiskAtomic as string },
+  });
+  assert.equal(reason(evaluateCopy(permission(), signal(), bad("1e7"))), "malformed_context");
+  assert.equal(reason(evaluateCopy(permission(), signal(), bad("-1"))), "malformed_context");
+  assert.equal(reason(evaluateCopy(permission(), signal(), bad(undefined))), "malformed_context");
+  assert.equal(reason(evaluateCopy(permission(), signal(), bad(1n))), "malformed_context");
+  // "0" is valid.
+  assert.equal(reason(evaluateCopy(permission(), signal(), bad("0"))), null);
 });
 test("malformed or unsafe copy policies are rejected before persistence", () => {
   const { signedPolicyHash: _, ...valid } = permission();
@@ -356,6 +419,7 @@ test("dry-run respects pause, stale, duplicate, cancelled and dependency inputs"
 });
 
 test("malformed and mismatched signals fail closed without throwing", () => {
+
   assert.equal(
     reason(
       evaluateCopy(
@@ -366,6 +430,7 @@ test("malformed and mismatched signals fail closed without throwing", () => {
     ),
     "signal_agent_mismatch",
   );
+
   assert.equal(
     reason(
       evaluateCopy(
@@ -376,12 +441,14 @@ test("malformed and mismatched signals fail closed without throwing", () => {
     ),
     "market_closed",
   );
+
   assert.equal(
     reason(
       evaluateCopy(permission(), signal({ stakeUsdc: Number.NaN }), context()),
     ),
     "malformed_signal",
   );
+
   assert.equal(
     reason(
       evaluateCopy(
@@ -392,6 +459,7 @@ test("malformed and mismatched signals fail closed without throwing", () => {
     ),
     "malformed_signal",
   );
+
   assert.equal(
     reason(
       evaluateCopy(
@@ -403,12 +471,14 @@ test("malformed and mismatched signals fail closed without throwing", () => {
             usedThisWeekUsdc: 0,
             openExposureUsdc: 0,
             realizedLossAtomic: "0",
+            principalAtRiskAtomic: "0",
           },
         }),
       ),
     ),
     "malformed_context",
   );
+
   assert.equal(
     reason(
       evaluateCopy(
@@ -420,12 +490,14 @@ test("malformed and mismatched signals fail closed without throwing", () => {
             usedThisWeekUsdc: 0,
             openExposureUsdc: 0,
             realizedLossAtomic: "0",
+            principalAtRiskAtomic: "0",
           },
         }),
       ),
     ),
     "malformed_context",
   );
+
 });
 
 // ── Usage from executions (permission-card budget bars) ──────────────────────
@@ -497,12 +569,13 @@ test("usage totals feed evaluateCopy with the gate's own view of the caps", () =
     execution({ created_at: DAY_START - 1, stake_atomic: String(9n * UNIT) }),
   ];
   const usage = computeCopyUsageFromExecutions(rows, NOW);
-  const derived = {
-    usedTodayUsdc: usage.usedTodayUsdc,
-    usedThisWeekUsdc: usage.usedThisWeekUsdc,
-    openExposureUsdc: usage.openExposureUsdc,
-    realizedLossAtomic: "0",
-  };
+const derived = {
+  usedTodayUsdc: usage.usedTodayUsdc,
+  usedThisWeekUsdc: usage.usedThisWeekUsdc,
+  openExposureUsdc: usage.openExposureUsdc,
+  realizedLossAtomic: "0",
+  principalAtRiskAtomic: "0",
+};
   // daily 9 + 3 USDC stake exceeds the 10 USDC cap.
   assert.equal(
     reason(
